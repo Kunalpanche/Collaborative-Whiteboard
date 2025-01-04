@@ -4,18 +4,18 @@ import { useEffect, useRef, useState } from 'react'
 import { io, Socket } from 'socket.io-client'
 import { Button } from './ui/button'
 import { Pencil, Square, Circle, Eraser } from 'lucide-react'
+import { UserNameModal } from './UserNameModal'
 
-interface Point {
+interface DrawingData {
+  type: 'stroke' | 'shape'
   x: number
   y: number
+  endX?: number
+  endY?: number
   color: string
   size: number
   tool: string
-}
-
-interface Shape extends Point {
-  endX: number
-  endY: number
+  userName: string
 }
 
 export default function Whiteboard() {
@@ -23,52 +23,51 @@ export default function Whiteboard() {
   const [socket, setSocket] = useState<Socket | null>(null)
   const [isDrawing, setIsDrawing] = useState(false)
   const [tool, setTool] = useState('pencil')
-  const [color, setColor] = useState('#000000')
+  const [color, setColor] = useState('#FFFFFF')
   const [size, setSize] = useState(2)
-  const [isClient, setIsClient] = useState(false)
-  const [startPoint, setStartPoint] = useState<Point | null>(null)
+  const [userName, setUserName] = useState<string | null>(null)
+  const [startPoint, setStartPoint] = useState<DrawingData | null>(null)
+  const [tempCanvas, setTempCanvas] = useState<HTMLCanvasElement | null>(null)
 
   useEffect(() => {
-    setIsClient(true)
-    const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3000'
-    const newSocket = io(BACKEND_URL, {
-      path: '/api/socket.io',
-    })
-    setSocket(newSocket)
+    if (userName) {
+      const BACKEND_URL = process.env.NEXT_PUBLIC_BACKEND_URL || 'http://localhost:3000'
+      const newSocket = io(BACKEND_URL, {
+        path: '/api/socket.io',
+      })
+      setSocket(newSocket)
 
-    return () => {
-      newSocket.close()
+      // Create temporary canvas for shape preview
+      const temp = document.createElement('canvas')
+      temp.width = 800
+      temp.height = 600
+      setTempCanvas(temp)
+
+      return () => {
+        newSocket.close()
+      }
     }
-  }, [])
+  }, [userName])
 
   useEffect(() => {
     if (!socket) return
 
-    socket.on('draw', (data: Point | Shape) => {
+    socket.on('draw', (data: DrawingData) => {
       const canvas = canvasRef.current
       const context = canvas?.getContext('2d')
       if (!context || !canvas) return
 
-      if (data.tool === 'eraser') {
-        context.globalCompositeOperation = 'destination-out'
-      } else {
-        context.globalCompositeOperation = 'source-over'
-      }
-
-      context.strokeStyle = data.color
-      context.lineWidth = data.size
-
-      if (data.tool === 'pencil') {
-        drawPencilStroke(context, data as Point)
-      } else if (data.tool === 'square') {
-        drawSquare(context, data as Shape)
-      } else if (data.tool === 'circle') {
-        drawCircle(context, data as Shape)
-      }
+      drawOnCanvas(context, data)
     })
+
+    return () => {
+      socket.off('draw')
+    }
   }, [socket])
 
   const startDrawing = (e: React.MouseEvent) => {
+    if (!userName) return
+
     setIsDrawing(true)
     const canvas = canvasRef.current
     if (!canvas) return
@@ -76,77 +75,173 @@ export default function Whiteboard() {
     const rect = canvas.getBoundingClientRect()
     const x = e.clientX - rect.left
     const y = e.clientY - rect.top
-    setStartPoint({ x, y, color, size, tool })
 
-    if (tool === 'pencil') {
+    const drawingData: DrawingData = {
+      type: tool === 'pencil' || tool === 'eraser' ? 'stroke' : 'shape',
+      x,
+      y,
+      color,
+      size,
+      tool,
+      userName
+    }
+
+    setStartPoint(drawingData)
+
+    if (tool === 'pencil' || tool === 'eraser') {
       draw(e)
     }
   }
 
   const stopDrawing = () => {
+    if (!isDrawing || !startPoint) return
+
+    const canvas = canvasRef.current
+    if (!canvas) return
+
+    const rect = canvas.getBoundingClientRect()
+    if (tool === 'square' || tool === 'circle') {
+      const context = canvas.getContext('2d')
+      if (!context) return
+
+      const drawingData: DrawingData = {
+        ...startPoint,
+        endX: startPoint.x,
+        endY: startPoint.y
+      }
+      
+      // Draw final shape
+      drawOnCanvas(context, drawingData)
+      socket?.emit('draw', drawingData)
+    }
+
     setIsDrawing(false)
     setStartPoint(null)
   }
 
   const draw = (e: React.MouseEvent) => {
-    if (!isDrawing || !socket || !startPoint) return
+    if (!isDrawing || !socket || !startPoint || !userName) return
 
     const canvas = canvasRef.current
     const context = canvas?.getContext('2d')
     if (!context || !canvas) return
 
     const rect = canvas.getBoundingClientRect()
-    const x = e.clientX - rect.left
-    const y = e.clientY - rect.top
+    const currentX = e.clientX - rect.left
+    const currentY = e.clientY - rect.top
 
-    if (tool === 'pencil') {
-      const point: Point = { x, y, color, size, tool }
-      socket.emit('draw', point)
-      drawPencilStroke(context, point)
-    } else if (tool === 'square' || tool === 'circle') {
-      const shape: Shape = { ...startPoint, endX: x, endY: y }
-      socket.emit('draw', shape)
-      redrawCanvas(context, shape)
+    if (tool === 'pencil' || tool === 'eraser') {
+      const drawingData: DrawingData = {
+        ...startPoint,
+        endX: currentX,
+        endY: currentY
+      }
+
+      socket.emit('draw', drawingData)
+      drawOnCanvas(context, drawingData)
+      
+      // Update start point for next segment
+      setStartPoint({
+        ...drawingData,
+        x: currentX,
+        y: currentY
+      })
+    } else if (tempCanvas) {
+      // Preview shape on temporary canvas
+      const tempContext = tempCanvas.getContext('2d')
+      if (!tempContext) return
+
+      tempContext.clearRect(0, 0, tempCanvas.width, tempCanvas.height)
+      
+      const drawingData: DrawingData = {
+        ...startPoint,
+        endX: currentX,
+        endY: currentY
+      }
+
+      drawOnCanvas(tempContext, drawingData)
+      
+      // Copy temp canvas to main canvas
+      context.clearRect(0, 0, canvas.width, canvas.height)
+      context.drawImage(tempCanvas, 0, 0)
     }
   }
 
-  const drawPencilStroke = (context: CanvasRenderingContext2D, point: Point) => {
-    context.beginPath()
-    context.arc(point.x, point.y, point.size / 2, 0, Math.PI * 2)
-    context.fillStyle = point.color
-    context.fill()
-  }
+  const drawOnCanvas = (context: CanvasRenderingContext2D, data: DrawingData) => {
+    const { x, y, endX, endY, color, size, tool, userName, type } = data
 
-  const drawSquare = (context: CanvasRenderingContext2D, shape: Shape) => {
-    context.beginPath()
-    context.rect(shape.x, shape.y, shape.endX - shape.x, shape.endY - shape.y)
-    context.stroke()
-  }
+    context.strokeStyle = color
+    context.fillStyle = color
+    context.lineWidth = size
+    context.lineCap = 'round'
+    context.lineJoin = 'round'
 
-  const drawCircle = (context: CanvasRenderingContext2D, shape: Shape) => {
-    context.beginPath()
-    const radiusX = Math.abs(shape.endX - shape.x) / 2
-    const radiusY = Math.abs(shape.endY - shape.y) / 2
-    const centerX = shape.x + radiusX
-    const centerY = shape.y + radiusY
-    context.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, 2 * Math.PI)
-    context.stroke()
-  }
+    if (tool === 'eraser') {
+      context.globalCompositeOperation = 'destination-out'
+      context.strokeStyle = '#000000'
+    } else {
+      context.globalCompositeOperation = 'source-over'
+    }
 
-  const redrawCanvas = (context: CanvasRenderingContext2D, shape: Shape) => {
-    const canvas = canvasRef.current
-    if (!canvas) return
-
-    context.clearRect(0, 0, canvas.width, canvas.height)
-    if (shape.tool === 'square') {
-      drawSquare(context, shape)
-    } else if (shape.tool === 'circle') {
-      drawCircle(context, shape)
+    switch (tool) {
+      case 'pencil':
+      case 'eraser':
+        if (endX !== undefined && endY !== undefined) {
+          context.beginPath()
+          context.moveTo(x, y)
+          context.lineTo(endX, endY)
+          context.stroke()
+          
+          // Only draw username at the start of a stroke
+          if (type === 'stroke' && x === endX && y === endY) {
+            context.globalCompositeOperation = 'source-over'
+            context.fillStyle = color
+            context.font = '12px Arial'
+            context.fillText(userName, x, y - 5)
+          }
+        }
+        break
+      case 'square':
+        if (endX !== undefined && endY !== undefined) {
+          context.beginPath()
+          const width = endX - x
+          const height = endY - y
+          context.rect(x, y, width, height)
+          context.stroke()
+          
+          // Draw username once for shapes
+          if (type === 'shape') {
+            context.globalCompositeOperation = 'source-over'
+            context.fillStyle = color
+            context.font = '12px Arial'
+            context.fillText(userName, x, y - 5)
+          }
+        }
+        break
+      case 'circle':
+        if (endX !== undefined && endY !== undefined) {
+          context.beginPath()
+          const radiusX = Math.abs(endX - x) / 2
+          const radiusY = Math.abs(endY - y) / 2
+          const centerX = x + (endX - x) / 2
+          const centerY = y + (endY - y) / 2
+          context.ellipse(centerX, centerY, radiusX, radiusY, 0, 0, 2 * Math.PI)
+          context.stroke()
+          
+          // Draw username once for shapes
+          if (type === 'shape') {
+            context.globalCompositeOperation = 'source-over'
+            context.fillStyle = color
+            context.font = '12px Arial'
+            context.fillText(userName, x, y - 5)
+          }
+        }
+        break
     }
   }
 
-  if (!isClient) {
-    return null // or a loading indicator
+  if (!userName) {
+    return <UserNameModal onSubmit={setUserName} />
   }
 
   return (
@@ -195,16 +290,18 @@ export default function Whiteboard() {
           className="w-32"
         />
       </div>
-      <canvas
-        ref={canvasRef}
-        width={800}
-        height={600}
-        className="border border-gray-300 rounded-lg"
-        onMouseDown={startDrawing}
-        onMouseUp={stopDrawing}
-        onMouseOut={stopDrawing}
-        onMouseMove={draw}
-      />
+      <div className="bg-black p-4 rounded-lg">
+        <canvas
+          ref={canvasRef}
+          width={800}
+          height={600}
+          className="border border-gray-600 rounded-lg"
+          onMouseDown={startDrawing}
+          onMouseUp={stopDrawing}
+          onMouseOut={stopDrawing}
+          onMouseMove={draw}
+        />
+      </div>
     </div>
   )
 }
